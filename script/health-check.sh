@@ -75,4 +75,4 @@ do
 
 done < "$INPUT_FILE"
 
-echo "Health check completed. Report saved to $OUTPUT_LOG"
+echo "Feature branch: Health check + email alerts completed"
