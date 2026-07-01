@@ -64,4 +64,4 @@ do
  
 done < "$INPUT_FILE"
  
-echo " Health check completed. Report saved to $OUTPUT_LOG"
+echo "Main branch: Health check completed"
