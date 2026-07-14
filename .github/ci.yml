@@ -1,0 +1,190 @@
+name: Full CI-CD Pipeline
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCOUNT_ID: "123456789012"
+  ECR_REPOSITORY: myapp
+
+jobs:
+
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Validate Shell Scripts
+        run: |
+          find . -name "*.sh" -exec shellcheck {} \;
+
+      - name: Validate Docker Compose
+        run: docker compose config
+
+  test:
+    if: github.event_name == 'pull_request'
+    needs: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Stack
+        run: |
+          docker compose up -d
+
+      - name: Wait for Containers
+        run: sleep 20
+
+      - name: Execute Health Check
+        run: |
+          chmod +x healthcheck.sh
+          ./healthcheck.sh
+
+      - name: Show Logs on Failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down
+
+  build:
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/CICDDeployer
+          aws-region: ap-south-1
+
+      - name: OIDC Proof
+        run: |
+          echo "sts:AssumeRoleWithWebIdentity"
+          aws sts get-caller-identity
+
+      - name: Login ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Multi-Arch Image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Create Build Report
+        run: |
+          echo "Digest: ${{ steps.build.outputs.digest }}" > report.txt
+          echo "Platform: linux/amd64, linux/arm64" >> report.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-report
+          path: report.txt
+
+      - name: Post PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `
+              ✅ Build Successful
+
+              Digest:
+              ${{ steps.build.outputs.digest }}
+
+              Platforms:
+              - linux/amd64
+              - linux/arm64
+              `
+            })
+
+  production-approval:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production
+
+    steps:
+      - run: echo "Deployment approved"
+
+  release:
+    if: github.ref == 'refs/heads/main'
+    needs: production-approval
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-report
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/CICDDeployer
+          aws-region: ap-south-1
+
+      - name: Generate Version
+        id: version
+        run: |
+          VERSION=v1.0.${{ github.run_number }}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Tag Image in ECR
+        run: |
+          MANIFEST=$(aws ecr batch-get-image \
+          --repository-name ${ECR_REPOSITORY} \
+          --image-ids imageTag=${GITHUB_SHA} \
+          --query 'images[].imageManifest' \
+          --output text)
+
+          aws ecr put-image \
+          --repository-name ${ECR_REPOSITORY} \
+          --image-tag ${{ steps.version.outputs.version }} \
+          --image-manifest "$MANIFEST"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          files: report.txt
